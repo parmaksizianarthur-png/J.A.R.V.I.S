@@ -87,7 +87,7 @@ APP_PROTOCOL = APP_VERSION.split()[-1]
 
 _DEFAULT_W, _DEFAULT_H = 1280, 780
 _MIN_W,     _MIN_H     = 1020, 680
-_HEADER_H = 112
+_HEADER_H = 110
 _LEFT_W  = 286
 _RIGHT_W = 286
 
@@ -203,6 +203,19 @@ def retheme_all_widgets(old: dict[str, str], new: dict[str, str]) -> None:
 
 def qcol(h: str, a: int = 255) -> QColor:
     c = QColor(h); c.setAlpha(a); return c
+
+
+def _short_voice_state(state: str) -> str:
+    return {
+        "LISTENING": "LISTEN",
+        "INITIALISING": "BOOT",
+        "PROCESSING": "PROC",
+        "THINKING": "THINK",
+        "SPEAKING": "TALK",
+        "MUTED": "MUTED",
+        "READY": "READY",
+        "IDLE": "IDLE",
+    }.get(state, state[:8])
 
 
 # ── Windows GPU via NVML DLL (no subprocess, no console window) ──────────────
@@ -390,6 +403,7 @@ def _windows_wifi_status() -> tuple[str, int | None] | None:
 class _SysMetrics:
     def __init__(self):
         self.cpu  = 0.0
+        self.cpu_per_core: tuple[float, ...] = ()
         self.mem  = 0.0
         self.net  = 0.0   
         self.gpu  = -1.0  
@@ -399,6 +413,7 @@ class _SysMetrics:
         self.mem_total_gb = 0.0
         self.disk_free_gb = -1.0
         self.disk_total_gb = -1.0
+        self.battery_percent = -1.0
         self.wifi = "N/A"
         self.wifi_quality = -1
         self.battery = "N/A"
@@ -428,7 +443,8 @@ class _SysMetrics:
             time.sleep(2.0)
 
     def _update(self):
-        cpu = psutil.cpu_percent(interval=None)
+        cpu_per_core = tuple(psutil.cpu_percent(interval=None, percpu=True))
+        cpu = sum(cpu_per_core) / len(cpu_per_core) if cpu_per_core else 0.0
         memory = psutil.virtual_memory()
         mem = memory.percent
         mem_used_gb = memory.used / (1024 ** 3)
@@ -462,9 +478,11 @@ class _SysMetrics:
             wifi_quality = quality if quality is not None else -1
 
         battery = "N/A"
+        battery_percent = -1.0
         try:
             state = psutil.sensors_battery()
             if state is not None:
+                battery_percent = float(state.percent)
                 battery = f"{state.percent:.0f}%  " + (
                     "CHARGING" if state.power_plugged else "ON BATTERY"
                 )
@@ -496,6 +514,7 @@ class _SysMetrics:
 
         with self._lock:
             self.cpu = cpu
+            self.cpu_per_core = cpu_per_core
             self.mem = mem
             self.net = net
             self.gpu = gpu
@@ -508,6 +527,7 @@ class _SysMetrics:
             self.wifi = wifi
             self.wifi_quality = wifi_quality
             self.battery = battery
+            self.battery_percent = battery_percent
 
     def _get_gpu(self) -> float:
         # pynvml — subprocess-free; initialise once and reuse the handle.
@@ -588,6 +608,7 @@ class _SysMetrics:
         with self._lock:
             return {
                 "cpu": self.cpu,
+                "cpu_per_core": self.cpu_per_core,
                 "mem": self.mem,
                 "net": self.net,
                 "gpu": self.gpu,
@@ -600,6 +621,7 @@ class _SysMetrics:
                 "wifi": self.wifi,
                 "wifi_quality": self.wifi_quality,
                 "battery": self.battery,
+                "battery_percent": self.battery_percent,
             }
 
 
@@ -662,6 +684,7 @@ class HudCanvas(QWidget):
         self._live_amp  = 0.0
         self._amp_disp  = 0.0
         self._wave_amp = 0.0
+        self._audio_dbfs: float | None = None
         # (frames, start_time, hop) posted by the playback thread — see
         # push_visemes(). None means "no schedule; use the plain level".
         self._visemes = None
@@ -734,7 +757,7 @@ class HudCanvas(QWidget):
         except Exception:
             pass
 
-    def set_audio_level(self, level: float) -> None:
+    def set_audio_level(self, level: float, dbfs: float | None = None) -> None:
         """Thread-safe entry point for the audio threads. Stores the louder of
         the incoming level and the current value so brief gaps between chunks
         don't make the waveform stutter; _step() decays it back down."""
@@ -748,6 +771,11 @@ class HudCanvas(QWidget):
             lv = 1.0
         if lv > self._live_amp:
             self._live_amp = lv
+        if dbfs is not None:
+            try:
+                self._audio_dbfs = max(-96.0, min(0.0, float(dbfs)))
+            except (TypeError, ValueError):
+                pass
 
     def _make_grid(self, W: int, H: int) -> QPixmap:
         """Pre-render the static grid-dot background into a transparent pixmap so
@@ -1188,39 +1216,69 @@ class HudCanvas(QWidget):
         # waveform — reacts to the real audio level (mic while listening,
         # JARVIS's own voice while speaking). Falls back to a gentle idle
         # ripple when there's no sound. _amp_disp is the smoothed 0–1 level.
-        baseline = min(H - 30, sy + 62)
-        count = 49
-        pitch = min(10.0, max(5.5, (W - 64) / count))
+        baseline = min(H - 58, sy + 68)
+        count = 65
+        pitch = min(9.0, max(4.5, (W - 52) / count))
         bar_w = max(3.0, pitch * 0.55)
         wx0 = (W - count * pitch) / 2
         amp = self._wave_amp
         mid = (count - 1) / 2.0
 
-        p.setPen(QPen(qcol(C.BORDER_B, 100), 1))
-        p.drawLine(QPointF(wx0 - 8, baseline), QPointF(wx0 + count * pitch + 8, baseline))
+        p.setPen(QPen(qcol(C.BORDER_B, 115), 1))
+        p.drawLine(QPointF(wx0 - 14, baseline),
+                   QPointF(wx0 + count * pitch + 14, baseline))
+        p.setPen(QPen(qcol(C.PRI, 45), 1))
+        for tick in range(17):
+            tick_x = wx0 - 12 + (count * pitch + 24) * tick / 16
+            tick_h = 5 if tick % 4 == 0 else 2.5
+            p.drawLine(QPointF(tick_x, baseline - tick_h),
+                       QPointF(tick_x, baseline + tick_h))
+
         for i in range(count):
             if self.muted:
-                hgt = 2.0 + 1.2 * math.sin(i * 0.52 + self._tick * 0.08)
+                hgt = 3.0 + 1.5 * (
+                    0.5 + 0.5 * math.sin(i * 0.52 + self._tick * 0.08)
+                )
                 color = C.MUTED_C
             else:
                 env = (1.0 - abs(i - mid) / mid) ** 0.48
-                wave_a = abs(math.sin(self._tick * 0.16 + i * 0.39))
-                wave_b = abs(math.sin(self._tick * 0.09 - i * 0.22))
-                idle = 2.0 + 3.5 * (0.58 * wave_a + 0.42 * wave_b)
-                hgt = min(46.0, idle + amp * 54.0 * env)
-                color = C.PRI
+                wave_a = abs(math.sin(self._tick * 0.14 + i * 0.31))
+                wave_b = abs(math.sin(self._tick * 0.075 - i * 0.19))
+                idle = 4.0 + 7.0 * (0.58 * wave_a + 0.42 * wave_b)
+                listening_lift = 2.0 if self.state == "LISTENING" else 0.0
+                hgt = min(72.0, idle + listening_lift + amp * 68.0 * env)
+                color = C.GREEN if self.state == "LISTENING" else C.PRI
 
             bar = QRectF(wx0 + i * pitch, baseline - hgt / 2, bar_w, hgt)
             grad = QLinearGradient(bar.left(), bar.top(), bar.right(), bar.bottom())
             grad.setColorAt(0.0, qcol(color, 145))
             grad.setColorAt(0.5, qcol(
-                "#b8f7ff" if amp > 0.035 and not self.muted else color,
-                245 if amp > 0.035 else 170,
+                "#c6fbff" if amp > 0.025 and not self.muted else color,
+                250 if amp > 0.025 else 190,
             ))
-            grad.setColorAt(1.0, qcol("#28baff" if not self.muted else color, 215))
+            grad.setColorAt(1.0, qcol(
+                C.PRI if not self.muted else color, 220
+            ))
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(grad))
             p.drawRoundedRect(bar, bar_w / 2, bar_w / 2)
+
+        footer_y = min(H - 14, baseline + 40)
+        p.setPen(QPen(qcol(C.TEXT_DIM, 175), 1))
+        p.setFont(QFont("Consolas", 7, QFont.Weight.DemiBold))
+        source_label = (
+            "VOICE OUTPUT  /  LIVE" if self.speaking
+            else "VOICE INPUT  /  LIVE" if self.state == "LISTENING"
+            else "AUDIO FIELD  /  STANDBY"
+        )
+        p.drawText(QRectF(wx0 - 12, footer_y, 136, 12),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   source_label)
+        level_text = f"{self._audio_dbfs:.0f} dBFS" if self._audio_dbfs is not None else "-- dBFS"
+        p.setPen(QPen(qcol(C.GREEN if self.state == "LISTENING" else C.PRI, 210), 1))
+        p.drawText(QRectF(wx0 + count * pitch - 112, footer_y, 124, 12),
+                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   level_text)
 
         p.end()   # end deterministically so the backing store never flushes an active painter
 
@@ -1357,6 +1415,10 @@ class RingGauge(QWidget):
         self._value = max(0.0, min(100.0, pct))
         self._text = text
 
+    def set_color(self, color: str):
+        self._color = color
+        self.update()
+
     def _animate(self):
         self._phase = (self._phase + 0.025) % 1.0
         self._display_value += (self._value - self._display_value) * 0.22
@@ -1399,7 +1461,7 @@ class RingGauge(QWidget):
         p.setBrush(QBrush(qcol("#07131e")))
         p.drawEllipse(QRectF(cx - 21, cy - 21, 42, 42))
 
-        value_size = 10 if len(self._text) <= 4 else 8
+        value_size = 10 if len(self._text) <= 4 else (8 if len(self._text) <= 5 else 7)
         p.setFont(QFont("Consolas", value_size, QFont.Weight.Bold))
         value_color = self._color if available else C.TEXT_DIM
         p.setPen(QPen(qcol(value_color), 1))
@@ -1460,6 +1522,58 @@ class WifiSignalIndicator(QWidget):
         )
         p.drawText(QRectF(0, base_y, self.width(), 10),
                    Qt.AlignmentFlag.AlignCenter, value)
+        p.end()
+
+
+class HeaderSparkline(QWidget):
+    def __init__(self, color: str, parent=None):
+        super().__init__(parent)
+        self._color = color
+        self._values: list[float] = []
+        self.setFixedSize(34, 20)
+
+    def set_value(self, value: float | None):
+        if value is None:
+            return
+        self._values.append(max(0.0, min(100.0, float(value))))
+        self._values = self._values[-18:]
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        if not p.isActive():
+            return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        p.setPen(QPen(qcol(C.BORDER_A, 150), 1))
+        p.drawLine(QPointF(1, H - 2), QPointF(W - 1, H - 2))
+        if len(self._values) > 1:
+            points = [
+                QPointF(
+                    1 + (W - 2) * index / (len(self._values) - 1),
+                    H - 2 - (H - 5) * value / 100.0,
+                )
+                for index, value in enumerate(self._values)
+            ]
+            line = QPainterPath(points[0])
+            for point in points[1:]:
+                line.lineTo(point)
+            area = QPainterPath(line)
+            area.lineTo(points[-1].x(), H - 2)
+            area.lineTo(points[0].x(), H - 2)
+            area.closeSubpath()
+            fill = QLinearGradient(0, 1, 0, H - 2)
+            fill.setColorAt(0, qcol(self._color, 85))
+            fill.setColorAt(1, qcol(self._color, 0))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(fill))
+            p.drawPath(area)
+            p.setPen(QPen(qcol(self._color, 230), 1.4))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(line)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(qcol(C.WHITE)))
+            p.drawEllipse(points[-1], 1.5, 1.5)
         p.end()
 
 
@@ -1527,6 +1641,133 @@ class NetActivityGraph(QWidget):
             p.setPen(QPen(qcol(C.WHITE), 1))
             p.setBrush(QBrush(qcol(C.PRI)))
             p.drawEllipse(points[-1], 2.5, 2.5)
+        p.end()
+
+
+class CpuCoreMap(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loads: tuple[float, ...] = ()
+        self._history: list[float] = []
+        self.setFixedHeight(140)
+        self.setMinimumWidth(120)
+        self.setToolTip(
+            "Live per-logical-core CPU utilisation, sampled by psutil."
+        )
+
+    def set_loads(self, loads: tuple[float, ...]):
+        bounded = tuple(max(0.0, min(100.0, float(load))) for load in loads[:24])
+        changed = bounded != self._loads
+        if changed:
+            self._loads = bounded
+        if bounded:
+            self._history.append(sum(bounded) / len(bounded))
+            self._history = self._history[-40:]
+        if changed:
+            self.setToolTip(
+                "Live per-logical-core CPU utilisation:\n"
+                + "  ".join(
+                    f"CPU {index}: {load:.0f}%"
+                    for index, load in enumerate(bounded)
+                )
+            )
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        if not p.isActive():
+            return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        width, height = self.width(), self.height()
+        frame = QRectF(1, 1, width - 2, height - 2)
+        p.setBrush(QBrush(qcol("#081624")))
+        p.setPen(QPen(qcol(C.BORDER), 1))
+        p.drawRoundedRect(frame, 7, 7)
+
+        p.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.TEXT_MED), 1))
+        total = psutil.cpu_count(logical=True) or len(self._loads)
+        avg = sum(self._loads) / len(self._loads) if self._loads else 0.0
+        title = f"CPU CORES  /  {total} LOGICAL"
+        p.drawText(QRectF(9, 5, width - 66, 12),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   title)
+        p.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.PRI), 1))
+        p.drawText(QRectF(width - 60, 5, 51, 12),
+                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   f"{avg:.0f}% AVG")
+        if not self._loads:
+            p.setFont(QFont("Consolas", 7))
+            p.setPen(QPen(qcol(C.TEXT_DIM), 1))
+            p.drawText(QRectF(8, 24, width - 16, 34),
+                       Qt.AlignmentFlag.AlignCenter, "WAITING FOR SENSOR DATA")
+            p.end()
+            return
+
+        displayed = self._loads
+        columns = min(4, len(displayed))
+        rows = (len(displayed) + columns - 1) // columns
+        gap_x, gap_y = 4.0, 3.0
+        left, top = 8.0, 22.0
+        footer_top = height - 19.0
+        cell_w = (width - 2 * left - (columns - 1) * gap_x) / columns
+        cell_h = min(
+            17.0,
+            (footer_top - top - 4 - (rows - 1) * gap_y) / rows,
+        )
+        for index, load in enumerate(displayed):
+            row, column = divmod(index, columns)
+            x = left + column * (cell_w + gap_x)
+            y = top + row * (cell_h + gap_y)
+            cell = QRectF(x, y, cell_w, cell_h)
+            bar_color = C.RED if load >= 85 else (
+                C.ACC2 if load >= 65 else C.PRI
+            )
+            p.setPen(QPen(qcol(bar_color, 125 if load >= 65 else 75), 1))
+            p.setBrush(QBrush(qcol("#0b1d2c")))
+            p.drawRoundedRect(cell, 3, 3)
+
+            fill_w = max(0.0, (cell_w - 4) * load / 100)
+            bar = QRectF(x + 2, y + 2, fill_w, cell_h - 4)
+            gradient = QLinearGradient(x, y, x + cell_w, y)
+            gradient.setColorAt(0, qcol(bar_color, 70))
+            gradient.setColorAt(1, qcol(bar_color, 155))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(gradient))
+            if fill_w > 0:
+                p.drawRoundedRect(bar, 2, 2)
+
+            p.setFont(QFont("Consolas", 6, QFont.Weight.Bold))
+            p.setPen(QPen(qcol(C.WHITE), 1))
+            p.drawText(cell.adjusted(3, 0, -3, 0),
+                       Qt.AlignmentFlag.AlignCenter,
+                       f"C{index + 1:02d}  {load:.0f}%")
+
+        graph = QRectF(width * 0.53, footer_top + 2, width * 0.44, 12)
+        p.setPen(QPen(qcol(C.BORDER_A, 150), 1))
+        p.drawLine(QPointF(graph.left(), graph.bottom()),
+                   QPointF(graph.right(), graph.bottom()))
+        for mark in range(1, 4):
+            mark_x = graph.left() + graph.width() * mark / 4
+            p.drawLine(QPointF(mark_x, graph.bottom() - 2),
+                       QPointF(mark_x, graph.bottom()))
+        if len(self._history) > 1:
+            path = QPainterPath()
+            for index, value in enumerate(self._history):
+                x = graph.left() + graph.width() * index / (len(self._history) - 1)
+                y = graph.bottom() - graph.height() * value / 100.0
+                if index == 0:
+                    path.moveTo(x, y)
+                else:
+                    path.lineTo(x, y)
+            p.setPen(QPen(qcol("#45cbff", 220), 1.5))
+            p.drawPath(path)
+        p.setFont(QFont("Segoe UI", 6, QFont.Weight.DemiBold))
+        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
+        p.drawText(QRectF(8, footer_top + 1, width * 0.48, 12),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   "LOAD TREND  /  80s")
         p.end()
 
 
@@ -4861,12 +5102,12 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        root.addWidget(self._build_header())
 
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
 
+        center_header = self._build_header()
         self._left_panel = self._build_left_panel()
         body.addWidget(self._left_panel, stretch=0)
 
@@ -5049,7 +5290,18 @@ class MainWindow(QMainWindow):
         self._center_split.setStretchFactor(0, 3)
         self._center_split.setStretchFactor(1, 1)
         self._center_split.setCollapsible(0, False)
-        body.addWidget(self._center_split, stretch=5)
+
+        center_column = QWidget()
+        center_column.setObjectName("CenterColumn")
+        center_column.setStyleSheet(
+            f"QWidget#CenterColumn {{ background: {C.BG}; }}"
+        )
+        center_layout = QVBoxLayout(center_column)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(0)
+        center_layout.addWidget(center_header, stretch=0)
+        center_layout.addWidget(self._center_split, stretch=1)
+        body.addWidget(center_column, stretch=5)
 
         self._right_panel = self._build_right_panel()
         body.addWidget(self._right_panel, stretch=0)
@@ -5692,6 +5944,7 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._update_header_density()
         cw = self.centralWidget()
         if self._overlay and self._overlay.isVisible():
             ow, oh = 460, 390
@@ -5734,6 +5987,7 @@ class MainWindow(QMainWindow):
 
     def _update_metrics(self):
         snap = _metrics.snapshot()
+        self._update_header_density()
 
         # CPU
         cpu = snap["cpu"]
@@ -5745,6 +5999,7 @@ class MainWindow(QMainWindow):
 
         # NET
         net = snap["net"]
+        self._core_load_map.set_loads(snap["cpu_per_core"])
         if net < 1.0:
             net_str = f"{net*1024:.0f}K"
         else:
@@ -5772,6 +6027,22 @@ class MainWindow(QMainWindow):
         self._bar_disk.set_value(disk if disk >= 0 else 0,
                                  f"{disk:.0f}%" if disk >= 0 else "N/A")
         self._bar_npu.set_value(0, "N/A")
+        battery_percent = snap["battery_percent"]
+        self._bar_battery.set_value(
+            battery_percent if battery_percent >= 0 else 0,
+            f"{battery_percent:.0f}%" if battery_percent >= 0 else "N/A",
+        )
+        self._bar_battery.set_color(
+            C.RED if 0 <= battery_percent < 15
+            else C.ACC2 if 0 <= battery_percent < 30
+            else C.GREEN
+        )
+        dbfs = self.hud._audio_dbfs
+        self._bar_audio.set_value(
+            max(0.0, min(100.0, (dbfs + 60.0) / 60.0 * 100.0))
+            if dbfs is not None else 0,
+            f"{dbfs:.0f}" if dbfs is not None else "N/A",
+        )
         mem_used_gb = snap["mem_used_gb"]
         mem_total_gb = snap["mem_total_gb"]
         self._ram_capacity_bar.setValue(int(mem))
@@ -5792,13 +6063,19 @@ class MainWindow(QMainWindow):
         self._wifi_signal.set_signal(
             wifi_quality, wifi == "CONNECTED"
         )
-        wifi_text = {
-            "CONNECTED": "LINK UP",
-            "OFFLINE": "LINK OFF",
-        }.get(wifi, "N/A")
+        wifi_text = (
+            f"UP  ·  {wifi_quality}%"
+            if wifi == "CONNECTED" and wifi_quality >= 0
+            else {"CONNECTED": "LINK UP", "OFFLINE": "LINK OFF"}.get(wifi, "N/A")
+        )
         self._wifi_value.setText(wifi_text)
+        wifi_color = (
+            C.RED if wifi == "CONNECTED" and 0 <= wifi_quality < 20
+            else C.ACC2 if wifi == "CONNECTED" and 0 <= wifi_quality < 45
+            else C.PRI if wifi == "CONNECTED" else C.TEXT_DIM
+        )
         self._wifi_value.setStyleSheet(
-            f"color: {C.PRI if wifi == 'CONNECTED' else C.TEXT_DIM}; "
+            f"color: {wifi_color}; "
             "background: transparent; border: none;"
         )
 
@@ -5810,10 +6087,17 @@ class MainWindow(QMainWindow):
             charge, _, status = battery.partition("  ")
             status_short = {"CHARGING": "CHARGING", "ON BATTERY": "ON BATTERY"}.get(status, status)
             battery_text = f"{charge}  {status_short}"
-            battery_color = C.GREEN if status == "CHARGING" else C.ACC2
+            battery_color = (
+                C.RED if battery_percent < 15
+                else C.GREEN if status == "CHARGING"
+                else C.ACC2
+            )
         self._battery_value.setText(battery_text)
         self._battery_value.setStyleSheet(
             f"color: {battery_color}; background: transparent; border: none;"
+        )
+        self._battery_tile_bar.setValue(
+            int(round(battery_percent)) if battery_percent >= 0 else 0
         )
         gpu_text = f"{gpu:.0f}%" if gpu >= 0 else "--"
         disk_text = f"{disk:.0f}%" if disk >= 0 else "--"
@@ -5824,17 +6108,21 @@ class MainWindow(QMainWindow):
             ("SSD", disk_text),
         ):
             self._header_metric_values[key].setText(value)
+        self._header_metric_graphs["CPU"].set_value(cpu)
+        self._header_metric_graphs["GPU"].set_value(gpu if gpu >= 0 else None)
+        self._header_metric_graphs["RAM"].set_value(mem)
+        self._header_metric_graphs["SSD"].set_value(disk if disk >= 0 else None)
         wifi_short = {"CONNECTED": "UP", "OFFLINE": "OFF"}.get(wifi, "--")
         wifi_reading = (f"{wifi_quality}%  {wifi_short}"
                         if wifi_quality >= 0 else wifi_short)
         battery_short = (
-            "N/A" if battery == "N/A"
-            else f"{battery.partition('%')[0]}% "
+            "N/A" if battery_percent < 0
+            else f"{battery_percent:.0f}% "
                  f"{'AC' if battery.endswith('CHARGING') else 'BAT'}"
         )
-        self._header_system_lbl.setText(
-            f"NET {net_str}/s   WI-FI {wifi_reading}   BAT {battery_short}"
-        )
+        self._header_net_lbl.setText(f"NET  {net_str}/s")
+        self._header_wifi_lbl.setText(wifi_reading)
+        self._header_battery_lbl.setText(f"BAT  {battery_short}")
         self._header_wifi_signal.set_signal(
             wifi_quality, wifi == "CONNECTED"
         )
@@ -5844,24 +6132,23 @@ class MainWindow(QMainWindow):
             elapsed = time.time() - boot_t
             h = int(elapsed // 3600)
             m = int((elapsed % 3600) // 60)
-            self._uptime_lbl.setText(f"UP  {h:02d}:{m:02d}")
+            self._header_uptime.setText(f"UP {h:02d}:{m:02d}")
         except Exception:
-            self._uptime_lbl.setText("UP  --:--")
+            h = m = 0
+            self._header_uptime.setText("UP  --:--")
 
         try:
             proc_count = len(psutil.pids())
-            self._proc_lbl.setText(f"PROC  {proc_count}")
+            self._header_processes.setText(f"PROC {proc_count}")
         except Exception:
             proc_count = 0
-            self._proc_lbl.setText("PROC  --")
+            self._header_processes.setText("PROC  --")
         try:
             self._header_link_lbl.setText(
-                f"● {self.hud.state}  ·  UP {h:02d}:{m:02d}  ·  {proc_count} PROC"
+                f"● {_short_voice_state(self.hud.state)}"
             )
-            self._header_uptime.setText(f"UP  {h:02d}:{m:02d}")
-            self._header_processes.setText(f"PROC  {proc_count}")
         except UnboundLocalError:
-            self._header_link_lbl.setText("● SYSTEM ONLINE  ·  LINK STANDBY")
+            self._header_link_lbl.setText("● SYSTEM ONLINE")
             self._header_uptime.setText("UP  --:--")
             self._header_processes.setText("PROC  --")
 
@@ -5879,37 +6166,12 @@ class MainWindow(QMainWindow):
             }}
         """)
         lay = QHBoxLayout(w)
-        lay.setContentsMargins(18, 6, 18, 6)
-        lay.setSpacing(10)
-
-        brand = QVBoxLayout()
-        brand.setSpacing(2)
-        brand_title = QLabel("J.A.R.V.I.S  /  MARK LVI")
-        brand_title.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        brand_title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
-        brand.addWidget(brand_title)
-        self._header_link_lbl = QLabel("● VOICE CORE  ·  SYSTEM READY")
-        self._header_link_lbl.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
-        self._header_link_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent;")
-        brand.addWidget(self._header_link_lbl)
-        brand_box = QWidget()
-        brand_box.setObjectName("HeaderBrand")
-        brand_box.setStyleSheet(f"""
-            QWidget#HeaderBrand {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #0b2034, stop:1 #07111e);
-                border: 1px solid #1764a0;
-                border-left: 2px solid {C.PRI};
-                border-radius: 7px;
-            }}
-        """)
-        brand.setContentsMargins(10, 5, 10, 5)
-        brand_box.setLayout(brand)
-        lay.addWidget(brand_box)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setSpacing(6)
 
         self._drawer_btn = QPushButton("⚙")
-        self._drawer_btn.setFixedSize(40, 40)
-        self._drawer_btn.setFont(QFont("Segoe UI Symbol", 17))
+        self._drawer_btn.setFixedSize(34, 32)
+        self._drawer_btn.setFont(QFont("Segoe UI Symbol", 14))
         self._drawer_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._drawer_btn.setToolTip("Settings & Controls")
         self._drawer_btn.setStyleSheet(f"""
@@ -5933,7 +6195,6 @@ class MainWindow(QMainWindow):
         self._drawer_btn.setCheckable(True)
         self._drawer_btn.setToolTip("Setup — things you set once")
         self._drawer_btn.clicked.connect(self._toggle_drawer)
-        lay.addWidget(self._drawer_btn)
 
         # A SECOND drawer, and the split is by how often a thing is touched.
         #
@@ -5942,30 +6203,30 @@ class MainWindow(QMainWindow):
         # day. Separating them by that — setup behind ⚙, everyday behind 🎛 —
         # is what makes each list short enough to read at a glance.
         self._ctrl_btn = QPushButton("🎛")
-        self._ctrl_btn.setFixedSize(40, 40)
-        self._ctrl_btn.setFont(QFont("Segoe UI Symbol", 17))
+        self._ctrl_btn.setFixedSize(34, 32)
+        self._ctrl_btn.setFont(QFont("Segoe UI Symbol", 14))
         self._ctrl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._ctrl_btn.setToolTip("Controls — the everyday switches")
         self._ctrl_btn.setStyleSheet(self._drawer_btn.styleSheet())
         self._ctrl_btn.setCheckable(True)
         self._ctrl_btn.clicked.connect(self._toggle_controls)
-        lay.addSpacing(4)
-        lay.addWidget(self._ctrl_btn)
-        lay.addStretch()
 
         mid = QVBoxLayout(); mid.setSpacing(1)
         _disp = self._assistant_name.upper()
         self._title_lbl = QLabel(_disp)
         self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._title_lbl.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
+        self._title_lbl.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         self._title_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
         mid.addWidget(self._title_lbl)
         _sub_text = ("Just A Rather Very Intelligent System"
                      if _disp in ("JARVIS", "J.A.R.V.I.S")
                      else "PERSONAL AI INTERFACE")
         self._sub_lbl = QLabel(_sub_text)
+        self._header_full_subtitle = _sub_text
+        self._header_sub_lbl = self._sub_lbl
         self._sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._sub_lbl.setFont(QFont("Segoe UI", 8))
+        self._sub_lbl.setWordWrap(True)
+        self._sub_lbl.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
         self._sub_lbl.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent;")
         mid.addWidget(self._sub_lbl)
         mid_box = QWidget()
@@ -5975,21 +6236,28 @@ class MainWindow(QMainWindow):
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
                     stop:0 #0b2034, stop:0.52 #081424, stop:1 #0b1e32);
                 border: 1px solid #174775;
-                border-top: 2px solid {C.PRI};
+                border-left: 2px solid {C.PRI};
                 border-bottom: 1px solid #1b684f;
                 border-radius: 8px;
             }}
         """)
-        mid.setContentsMargins(8, 3, 8, 2)
-        self._sub_lbl.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+        mid.setContentsMargins(5, 3, 5, 3)
         mid_box.setLayout(mid)
-        lay.addWidget(mid_box, stretch=1)
+        mid_box.setFixedWidth(144)
+        self._header_identity_box = mid_box
+        self._header_identity_layout = mid
+        lay.addWidget(mid_box, stretch=0)
 
-        right_col = QVBoxLayout(); right_col.setSpacing(5)
+        right_col = QVBoxLayout()
+        right_col.setContentsMargins(0, 0, 0, 0)
+        right_col.setSpacing(3)
         metrics_row = QHBoxLayout()
         metrics_row.setContentsMargins(0, 0, 0, 0)
-        metrics_row.setSpacing(6)
+        metrics_row.setSpacing(4)
         self._header_metric_values = {}
+        self._header_metric_graphs = {}
+        self._header_metric_cards = {}
+        self._header_metric_labels = {}
         for key, color in (
             ("CPU", "#38baff"),
             ("GPU", "#a88aff"),
@@ -6007,18 +6275,33 @@ class MainWindow(QMainWindow):
                 }}
             """)
             metric_lay = QVBoxLayout(metric)
-            metric_lay.setContentsMargins(7, 3, 7, 3)
-            metric_lay.setSpacing(1)
+            metric_lay.setContentsMargins(6, 3, 6, 3)
+            metric_lay.setSpacing(0)
+            metric.setMinimumHeight(42)
             name = QLabel(key)
-            name.setFont(QFont("Segoe UI", 6, QFont.Weight.Bold))
+            name.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
             name.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+            name.setMinimumWidth(0)
             reading = QLabel("--")
-            reading.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+            reading.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
             reading.setStyleSheet(f"color: {color}; background: transparent;")
+            reading.setMinimumWidth(0)
+            reading.setSizePolicy(
+                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+            )
             metric_lay.addWidget(name)
-            metric_lay.addWidget(reading)
+            reading_row = QHBoxLayout()
+            reading_row.setContentsMargins(0, 0, 0, 0)
+            reading_row.setSpacing(2)
+            reading_row.addWidget(reading, stretch=1)
+            graph = HeaderSparkline(color)
+            reading_row.addWidget(graph, alignment=Qt.AlignmentFlag.AlignVCenter)
+            metric_lay.addLayout(reading_row)
             metrics_row.addWidget(metric, stretch=1)
             self._header_metric_values[key] = reading
+            self._header_metric_graphs[key] = graph
+            self._header_metric_cards[key] = metric
+            self._header_metric_labels[key] = name
         right_col.addLayout(metrics_row)
         system_box = QWidget()
         system_box.setObjectName("HeaderSystemStrip")
@@ -6030,53 +6313,76 @@ class MainWindow(QMainWindow):
                 border-radius: 5px;
             }
         """)
+        system_box.setMinimumHeight(28)
         system_row = QHBoxLayout(system_box)
-        system_row.setContentsMargins(5, 1, 4, 1)
+        system_row.setContentsMargins(7, 2, 7, 2)
         system_row.setSpacing(4)
-        self._header_system_lbl = QLabel("NET --   WI-FI --   BAT --")
-        self._header_system_lbl.setFont(QFont("Consolas", 7, QFont.Weight.DemiBold))
-        self._header_system_lbl.setStyleSheet(
-            f"color: {C.TEXT_MED}; background: transparent;"
-        )
-        self._header_system_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-        system_row.addWidget(self._header_system_lbl, stretch=1)
+        self._header_net_lbl = QLabel("NET  --")
+        self._header_wifi_lbl = QLabel("--")
+        self._header_battery_lbl = QLabel("BAT  --")
+        for label, color in (
+            (self._header_net_lbl, "#55d7ff"),
+            (self._header_wifi_lbl, C.TEXT_MED),
+            (self._header_battery_lbl, C.GREEN),
+        ):
+            label.setFont(QFont("Consolas", 8, QFont.Weight.DemiBold))
+            label.setStyleSheet(
+                f"color: {color}; background: transparent; padding: 0 3px;"
+            )
+            label.setMinimumWidth(0)
+            label.setSizePolicy(
+                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+            )
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        system_row.addWidget(self._header_net_lbl, stretch=1)
+        wifi_status = QHBoxLayout()
+        wifi_status.setContentsMargins(0, 0, 0, 0)
+        wifi_status.setSpacing(2)
         self._header_wifi_signal = WifiSignalIndicator()
-        self._header_wifi_signal.setFixedSize(48, 30)
-        system_row.addWidget(self._header_wifi_signal)
+        self._header_wifi_signal.setFixedSize(38, 24)
+        wifi_status.addWidget(self._header_wifi_signal)
+        wifi_status.addWidget(self._header_wifi_lbl, stretch=1)
+        system_row.addLayout(wifi_status, stretch=1)
+        system_row.addWidget(self._header_battery_lbl, stretch=1)
         right_col.addWidget(system_box)
 
         center_status = QHBoxLayout()
-        center_status.setContentsMargins(8, 2, 8, 2)
-        center_status.setSpacing(6)
-        self._header_core_status = QLabel("VOICE CORE  /  INITIALISING")
-        self._header_core_status.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
-        self._header_core_status.setStyleSheet(
-            f"color: {C.GREEN}; background: #081c1b; "
-            "border: 1px solid #15513f; border-radius: 4px; padding: 3px 6px;"
-        )
-        self._header_core_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        center_status.addWidget(self._header_core_status, stretch=2)
+        center_status.setContentsMargins(2, 0, 2, 0)
+        center_status.setSpacing(5)
+        self._header_link_lbl = QLabel("● VOICE / SYSTEM READY")
+        self._header_link_lbl.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        self._header_link_lbl.setMinimumWidth(0)
+        self._header_link_lbl.setToolTip("Current assistant voice state")
         self._header_uptime = QLabel("UP  --:--")
-        self._header_uptime.setFont(QFont("Consolas", 7, QFont.Weight.DemiBold))
+        self._header_uptime.setFont(QFont("Consolas", 8, QFont.Weight.DemiBold))
         self._header_uptime.setStyleSheet(
             f"color: {C.TEXT_MED}; background: transparent;"
         )
         self._header_uptime.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        center_status.addWidget(self._header_uptime, stretch=1)
         self._header_processes = QLabel("PROC  --")
-        self._header_processes.setFont(QFont("Consolas", 7, QFont.Weight.DemiBold))
+        self._header_processes.setFont(QFont("Consolas", 8, QFont.Weight.DemiBold))
         self._header_processes.setStyleSheet(
             f"color: {C.TEXT_MED}; background: transparent;"
         )
         self._header_processes.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        for label in (self._header_uptime, self._header_processes):
+            label.setMinimumWidth(0)
+            label.setSizePolicy(
+                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+            )
+        self._header_processes.setToolTip("Running system processes")
+        self._header_link_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent;")
+        center_status.addWidget(self._header_link_lbl, stretch=2)
+        center_status.addWidget(self._header_uptime, stretch=1)
         center_status.addWidget(self._header_processes, stretch=1)
-        mid.addLayout(center_status)
+        right_col.addLayout(center_status)
 
         data_content = QWidget()
         data_content.setObjectName("HeaderDataContent")
         data_content.setStyleSheet("QWidget#HeaderDataContent { background: transparent; }")
         data_content.setLayout(right_col)
-        data_content.setMinimumWidth(288)
+        data_content.setMinimumWidth(0)
+        self._header_data_content = data_content
         clock_box = QWidget()
         clock_box.setObjectName("HeaderClock")
         clock_box.setStyleSheet(f"""
@@ -6090,10 +6396,10 @@ class MainWindow(QMainWindow):
             }}
         """)
         clock_col = QVBoxLayout(clock_box)
-        clock_col.setContentsMargins(9, 8, 9, 8)
-        clock_col.setSpacing(2)
+        clock_col.setContentsMargins(5, 4, 5, 4)
+        clock_col.setSpacing(1)
         self._clock_lbl = QLabel("00:00:00")
-        self._clock_lbl.setFont(QFont("Consolas", 16, QFont.Weight.Bold))
+        self._clock_lbl.setFont(QFont("Consolas", 15, QFont.Weight.Bold))
         self._clock_lbl.setStyleSheet(f"color: #45cbff; background: transparent;")
         self._clock_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._date_lbl = QLabel("")
@@ -6113,13 +6419,73 @@ class MainWindow(QMainWindow):
         """)
         right_row = QHBoxLayout(data_box)
         right_row.setContentsMargins(0, 0, 0, 0)
-        right_row.setSpacing(7)
+        right_row.setSpacing(5)
         right_row.addWidget(data_content, stretch=1)
         right_row.addWidget(clock_box)
-        data_box.setMinimumWidth(414)
-        clock_box.setFixedWidth(134)
-        lay.addWidget(data_box)
+        data_box.setMinimumWidth(0)
+        clock_box.setFixedWidth(122)
+        self._header_clock_box = clock_box
+        lay.addWidget(data_box, stretch=1)
+        self._header_root = w
         return w
+
+    def _update_header_density(self):
+        if not hasattr(self, "_header_root"):
+            return
+        width = self._header_root.width()
+        compact = width < 560
+        medium = 560 <= width < 660
+        if compact:
+            identity_width, clock_width = 116, 100
+            graph_visible = False
+            label_size, value_size, system_size = 7, 9, 7
+            signal_size = (30, 20)
+        elif medium:
+            identity_width, clock_width = 128, 108
+            graph_visible = self._header_data_content.width() >= 340
+            label_size, value_size, system_size = 7, 9, 7
+            signal_size = (34, 22)
+        else:
+            identity_width, clock_width = 144, 122
+            graph_visible = True
+            label_size, value_size, system_size = 8, 10, 8
+            signal_size = (38, 24)
+
+        self._header_identity_box.setFixedWidth(identity_width)
+        self._header_clock_box.setFixedWidth(clock_width)
+        self._header_sub_lbl.setText(
+            "INTELLIGENT SYSTEM" if compact else self._header_full_subtitle
+        )
+        self._header_sub_lbl.setToolTip(self._header_full_subtitle)
+        self._header_wifi_signal.setFixedSize(*signal_size)
+        for key, reading in self._header_metric_values.items():
+            reading.setFont(QFont("Consolas", value_size, QFont.Weight.Bold))
+            graph = self._header_metric_graphs[key]
+            graph.setVisible(graph_visible)
+            metric = self._header_metric_cards[key]
+            metric_layout = metric.layout()
+            if metric_layout is not None:
+                horizontal = 3 if compact else 6
+                metric_layout.setContentsMargins(horizontal, 2, horizontal, 2)
+            self._header_metric_labels[key].setFont(
+                QFont("Segoe UI", label_size, QFont.Weight.Bold)
+            )
+        for label in (
+            self._header_net_lbl, self._header_wifi_lbl,
+            self._header_battery_lbl,
+        ):
+            label.setFont(QFont("Consolas", system_size, QFont.Weight.DemiBold))
+        status_size = 7 if compact else 8
+        self._header_link_lbl.setFont(
+            QFont("Consolas", status_size, QFont.Weight.Bold)
+        )
+        self._header_uptime.setFont(
+            QFont("Consolas", status_size, QFont.Weight.DemiBold)
+        )
+        self._header_processes.setFont(
+            QFont("Consolas", status_size, QFont.Weight.DemiBold)
+        )
+        self._header_root.updateGeometry()
 
     def _tick_clock(self):
         self._clock_lbl.setText(time.strftime("%H:%M:%S"))
@@ -6143,17 +6509,9 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setStyleSheet(f"""
             QScrollArea {{ background: transparent; border: none; }}
-            QScrollBar:vertical {{
-                background: {C.DARK}; width: 6px; border: none; margin: 2px 0;
-            }}
-            QScrollBar::handle:vertical {{
-                background: {C.BORDER_B}; border-radius: 3px; min-height: 24px;
-            }}
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-                height: 0; border: none;
-            }}
         """)
         outer.addWidget(scroll)
 
@@ -6166,13 +6524,22 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(8)
 
+        telemetry_header = QHBoxLayout()
+        telemetry_header.setContentsMargins(0, 0, 0, 5)
+        telemetry_header.setSpacing(5)
         hdr = QLabel("◈  SYSTEM TELEMETRY")
         hdr.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         hdr.setStyleSheet(
-            f"color: {C.PRI}; background: transparent; "
-            f"border-bottom: 1px solid {C.BORDER}; padding-bottom: 7px;"
+            f"color: {C.PRI}; background: transparent;"
         )
-        lay.addWidget(hdr)
+        telemetry_header.addWidget(hdr, stretch=1)
+        self._drawer_btn.setFixedSize(34, 32)
+        self._drawer_btn.setFont(QFont("Segoe UI Symbol", 14))
+        self._ctrl_btn.setFixedSize(34, 32)
+        self._ctrl_btn.setFont(QFont("Segoe UI Symbol", 14))
+        telemetry_header.addWidget(self._drawer_btn)
+        telemetry_header.addWidget(self._ctrl_btn)
+        lay.addLayout(telemetry_header)
 
         self._bar_cpu = RingGauge("CPU", "#168cff")
         self._bar_mem = RingGauge("RAM", "#32dcff")
@@ -6181,6 +6548,15 @@ class MainWindow(QMainWindow):
         self._bar_disk = RingGauge("SSD", "#4a91f2")
         self._bar_npu = RingGauge("NPU", "#ed70ff")
         self._bar_tmp = RingGauge("THERMAL", C.ACC)
+        self._bar_battery = RingGauge("BATTERY", C.GREEN)
+        self._bar_audio = RingGauge("AUDIO dBFS", "#ff536f")
+        self._bar_battery.setToolTip(
+            "Battery charge percentage reported by the operating system."
+        )
+        self._bar_audio.setToolTip(
+            "Digital audio level in dBFS (decibels relative to digital full scale), "
+            "not calibrated acoustic sound-pressure level."
+        )
         self._bar_disk.setToolTip(
             "Used capacity on the system volume. Drive health and SSD wear "
             "are not exposed by this cross-platform monitor."
@@ -6199,7 +6575,7 @@ class MainWindow(QMainWindow):
         for index, gauge in enumerate((
             self._bar_cpu, self._bar_mem, self._bar_gpu,
             self._bar_net, self._bar_disk, self._bar_npu,
-            self._bar_tmp,
+            self._bar_tmp, self._bar_battery, self._bar_audio,
         )):
             gauges.addWidget(gauge, index // 3, index % 3,
                              alignment=Qt.AlignmentFlag.AlignCenter)
@@ -6215,8 +6591,10 @@ class MainWindow(QMainWindow):
             tile.setObjectName("TelemetryTile")
             tile.setStyleSheet(f"""
                 QWidget#TelemetryTile {{
-                    background: {C.PANEL2};
-                    border: 1px solid {C.BORDER};
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 #0c2032, stop:1 {C.PANEL2});
+                    border: 1px solid #17405f;
+                    border-top: 2px solid {accent};
                     border-radius: 7px;
                 }}
             """)
@@ -6235,11 +6613,31 @@ class MainWindow(QMainWindow):
             body.setSpacing(5)
             if title == "WI-FI LINK":
                 self._wifi_signal = WifiSignalIndicator()
+                self._wifi_signal.setFixedSize(58, 42)
                 body.addWidget(self._wifi_signal)
                 value_lbl.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
                 value_lbl.setWordWrap(True)
             body.addWidget(value_lbl, stretch=1)
             tile_lay.addLayout(body)
+            if title == "BATTERY":
+                self._battery_tile_bar = QProgressBar()
+                self._battery_tile_bar.setRange(0, 100)
+                self._battery_tile_bar.setValue(0)
+                self._battery_tile_bar.setTextVisible(False)
+                self._battery_tile_bar.setFixedHeight(7)
+                self._battery_tile_bar.setStyleSheet(f"""
+                    QProgressBar {{
+                        background: #06101b;
+                        border: 1px solid #173b5a;
+                        border-radius: 3px;
+                    }}
+                    QProgressBar::chunk {{
+                        background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                            stop:0 {C.GREEN_D}, stop:1 {C.GREEN});
+                        border-radius: 2px;
+                    }}
+                """)
+                tile_lay.addWidget(self._battery_tile_bar)
             return tile, value_lbl
 
         wifi_tile, self._wifi_value = _status_tile("WI-FI LINK", "CHECKING", C.PRI)
@@ -6255,36 +6653,29 @@ class MainWindow(QMainWindow):
         )
         lay.addLayout(status_row)
 
-        info_panel = QWidget()
-        info_panel.setObjectName("SystemInfo")
-        info_panel.setStyleSheet(f"""
-            QWidget#SystemInfo {{
-                background: {C.PANEL2};
-                border: 1px solid {C.BORDER};
-                border-radius: 7px;
+        core_panel = QWidget()
+        core_panel.setObjectName("CoreLoadPanel")
+        core_panel.setStyleSheet(f"""
+            QWidget#CoreLoadPanel {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #0b2034, stop:1 #071321);
+                border: 1px solid #174775;
+                border-top: 2px solid #38baff;
+                border-radius: 8px;
             }}
         """)
-        ip_lay = QVBoxLayout(info_panel)
-        ip_lay.setContentsMargins(10, 8, 10, 8)
-        ip_lay.setSpacing(5)
-
-        self._uptime_lbl = QLabel("UP  --:--")
-        self._uptime_lbl.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
-        self._uptime_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent; border: none;")
-        ip_lay.addWidget(self._uptime_lbl)
-
-        self._proc_lbl = QLabel("PROC  --")
-        self._proc_lbl.setFont(QFont("Consolas", 8))
-        self._proc_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; border: none;")
-        ip_lay.addWidget(self._proc_lbl)
-
-        os_name = {"Windows": "WINDOWS", "Darwin": "macOS", "Linux": "LINUX"}.get(_OS, _OS.upper())
-        os_lbl = QLabel(f"OS  /  {os_name}")
-        os_lbl.setFont(QFont("Consolas", 8))
-        os_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; border: none;")
-        ip_lay.addWidget(os_lbl)
-
-        lay.addWidget(info_panel)
+        core_lay = QVBoxLayout(core_panel)
+        core_lay.setContentsMargins(7, 6, 7, 6)
+        core_lay.setSpacing(3)
+        core_title = QLabel("◈  PER-CORE CPU LOAD")
+        core_title.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        core_title.setStyleSheet(
+            f"color: {C.PRI}; background: transparent; border: none;"
+        )
+        core_lay.addWidget(core_title)
+        self._core_load_map = CpuCoreMap()
+        core_lay.addWidget(self._core_load_map)
+        lay.addWidget(core_panel)
 
         resource_panel = QWidget()
         resource_panel.setObjectName("ResourceSnapshot")
@@ -6351,14 +6742,6 @@ class MainWindow(QMainWindow):
         self._storage_capacity_bar, self._storage_capacity_lbl = _capacity_row(
             "SYSTEM DRIVE  /  USED", "#38d8a5"
         )
-        self._resource_cpu_lbl = QLabel(
-            f"CPU THREADS  {psutil.cpu_count(logical=True) or '--'}"
-        )
-        self._resource_cpu_lbl.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
-        self._resource_cpu_lbl.setStyleSheet(
-            f"color: {C.TEXT_MED}; background: transparent;"
-        )
-        resource_lay.addWidget(self._resource_cpu_lbl)
         lay.addWidget(resource_panel)
 
         return w
@@ -6725,26 +7108,21 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_ctrl_btn"):
             self._ctrl_btn.setChecked(False)
 
-    def _place_drawer(self, drawer, left: int):
+    def _place_drawer(self, drawer, anchor: QPushButton):
         _W = 258
         drawer.setFixedWidth(_W)
         drawer.adjustSize()
-        drawer.setGeometry(left, _HEADER_H, _W, drawer.sizeHint().height())
+        position = anchor.mapTo(self.centralWidget(), QPoint(0, anchor.height()))
+        left = max(8, min(position.x(), self.centralWidget().width() - _W - 8))
+        drawer.setGeometry(left, position.y(), _W, drawer.sizeHint().height())
 
     def _position_quick_drawer(self):
         if hasattr(self, "_quick_drawer"):
-            self._place_drawer(self._quick_drawer, 12)
+            self._place_drawer(self._quick_drawer, self._drawer_btn)
 
     def _position_ctrl_drawer(self):
-        # Under its own header button rather than under the other one's.
         if hasattr(self, "_ctrl_drawer"):
-            left = 12
-            try:
-                left = max(12, self._ctrl_btn.mapTo(self.centralWidget(),
-                                                    QPoint(0, 0)).x() - 8)
-            except Exception:
-                pass
-            self._place_drawer(self._ctrl_drawer, left)
+            self._place_drawer(self._ctrl_drawer, self._ctrl_btn)
 
     def _build_input_row(self) -> QHBoxLayout:
         row = QHBoxLayout(); row.setSpacing(4)
@@ -7988,15 +8366,10 @@ class MainWindow(QMainWindow):
                 f"color: {color}; background: transparent;"
             )
         if hasattr(self, "_header_link_lbl"):
-            self._header_link_lbl.setText(f"● {state}  ·  VOICE CORE")
+            self._header_link_lbl.setText(f"● {_short_voice_state(state)}")
+            self._header_link_lbl.setToolTip(f"Voice core state: {state}")
             self._header_link_lbl.setStyleSheet(
                 f"color: {color}; background: transparent;"
-            )
-        if hasattr(self, "_header_core_status"):
-            self._header_core_status.setText(f"VOICE CORE  /  {state}")
-            self._header_core_status.setStyleSheet(
-                f"color: {color}; background: #081c1b; "
-                f"border: 1px solid {color}; border-radius: 4px; padding: 3px 6px;"
             )
 
     def _check_config(self) -> bool:
@@ -8154,12 +8527,12 @@ class JarvisUI:
     def wake_get_state(self, cb):
         self._win.wake_get_state = cb
 
-    def set_audio_level(self, level: float) -> None:
+    def set_audio_level(self, level: float, dbfs: float | None = None) -> None:
         """Thread-safe: feed a 0.0–1.0 live audio level to the HUD waveform.
         Called from the audio threads; a plain float store is atomic under the
         GIL, so no signal/lock is needed for this cosmetic value."""
         try:
-            self._win.hud.set_audio_level(level)
+            self._win.hud.set_audio_level(level, dbfs)
         except Exception:
             pass
 
