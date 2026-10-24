@@ -35,6 +35,7 @@ for _stream in ("stdout", "stderr"):
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
+import math
 import re
 import threading
 import time
@@ -133,6 +134,20 @@ def _pcm_level(samples) -> float:
     if rms <= _LEVEL_FLOOR:
         return 0.0
     return min(1.0, (rms - _LEVEL_FLOOR) / (_LEVEL_FULL - _LEVEL_FLOOR))
+
+
+def _pcm_dbfs(samples) -> float:
+    """Return int16 PCM RMS level in dBFS, bounded to a useful -96..0 range."""
+    try:
+        x = np.asarray(samples, dtype=np.float32)
+        if x.size == 0:
+            return -96.0
+        rms = float(np.sqrt(np.mean(x * x)))
+        if rms <= 0.0:
+            return -96.0
+        return max(-96.0, min(0.0, 20.0 * math.log10(rms / 32768.0)))
+    except Exception:
+        return -96.0
 
 
 # ── Viseme extraction ─────────────────────────────────────────────────────────
@@ -1538,7 +1553,9 @@ class JarvisLive:
                 # the user's actual voice while listening. Purely cosmetic — any
                 # failure here must never disturb the mic.
                 try:
-                    self.ui.set_audio_level(_pcm_level(indata))
+                    self.ui.set_audio_level(
+                        _pcm_level(indata), _pcm_dbfs(indata)
+                    )
                 except Exception:
                     pass
 
@@ -1868,6 +1885,8 @@ class JarvisLive:
                     # yielded frames, so a block too short to analyse cannot
                     # shift everything after it out of step with the audio.
                     self._play_cursor += pcm.size / RECEIVE_SAMPLE_RATE
+                    lvl = _pcm_level(pcm)
+                    self.ui.set_audio_level(lvl, _pcm_dbfs(pcm))
                     if frames:
                         frames = self._visemes.frames(frames, hop)
                         self.ui.push_visemes(frames, hop, at)
@@ -1877,8 +1896,6 @@ class JarvisLive:
                         self._echo.note_output(pcm, RECEIVE_SAMPLE_RATE,
                                                self._out_level)
                     else:
-                        lvl = _pcm_level(pcm)
-                        self.ui.set_audio_level(lvl)
                         self._out_level = lvl
                         self._echo.note_output(pcm, RECEIVE_SAMPLE_RATE, lvl)
                 except Exception:
